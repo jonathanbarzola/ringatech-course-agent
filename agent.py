@@ -1,137 +1,74 @@
 from dotenv import load_dotenv
 from groq import Groq
 import os
+from gemini_embedder import GeminiEmbedder
 from simple_memory import SimpleMemory
 import json
+from supabase_doc_store import SupabaseDocStore
 from tools import Tools
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from long_term_memory import LongTermMemory
 
 load_dotenv()
 
 MEMORY_MAX_MESSAGES = 10
 
 api_key = os.environ.get("GROQ_API_KEY")
+
 client = Groq(api_key=api_key)
 memory = SimpleMemory(max_messages=MEMORY_MAX_MESSAGES)
 now = datetime.now(ZoneInfo("America/Lima"))
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+embedder = GeminiEmbedder(api_key=GEMINI_API_KEY)
+store = SupabaseDocStore(database_url=DATABASE_URL)
+
+
 SYSTEM_PROMPT = f"""
-Eres un asistente que habla español y responde de manera muy breve y concisa.
+# ROL
+Eres un agente de servicio al cliente del área de devoluciones.
 
-Reglas:
-- Antes de crear una reunión, SIEMPRE debes pedir confirmación explicita al usuario.
-- Si el usuario no confirma, NO llames create_event.
-- Sí el usuario te pide borrar un evento, SIEMPRE debes pedir confirmación explicita al usuario.
-- Si el usuario no confirma, NO llames delete_event.
-- Si el usuario te pide borrar un evento, PRIMERO debes listar los eventos con list_events debido a que este método retornara el event_id que es necesario para borrar el evento.
+Los usuarios te contactarán con dudas relacionadas a las devoluciones.
+Para cualquier consulta relacionada a devoluciones de todo tipo,
+debes consultar la información actualizada utilizando
+la herramienta "politicas_de_devoluciones"
 
-Fecha y hora actual:
-{now.strftime("%Y-%m-%d %H:%M:%S")} (UTC-5, Lima, Perú)
+# HERRAMIENTAS
+## politicas_de_devoluciones
+Esta herramienta debes llamarla siempre que el usuario desee saber algo
+relacionado a las devoluciones. Si no está claro según la pregunta,
+entonces también utiliza la herramienta.
+
+# REGLAS
+- No debes inventar información de ningún tipo. Solo utiliza lo que se te
+proporciona como parte de la herramienta.
+- Puedes ser amigable pero eres del área de devoluciones, por lo que sé servicial
+pero no intentes ayudar más allá de dar la información explícita que te solicitan,
+basado en la información de las políticas de devoluciones en la herramienta.
+
 """
+
 TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "check_availability",
+            "name": "politicas_de_devoluciones",
             "description": (
-                "Revisa si el calendario del usuario está disponible entre time_ini y time_end "
-                "usando Google Calendar. los datos time_ini y time_end DEBEN estar en el formato "
-                "RFC3339 (con offset para la zona horaria). Por ejemplo: "
-                "2026-06-20T08:00:00-05:00"
+                "Obtiene información importante y actualizada acerca de las Políticas de Devoluciones"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "time_ini": {
+                    "query": {
                         "type": "string",
-                        "description": "la fecha de inicio para revisar disponibilidad en formato RFC3339"
-                    },
-                    "time_end": {
-                        "type": "string",
-                        "description": "la fecha fin para revisar disponibilidad en formato RFC3339"
-                    }
-                },
-                "required": ["time_ini", "time_end"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "create_event",
-            "description": (
-                "Crea un evento en el calendario del usuario usando Google Calendar. "
-                "start y end DEBEN estar en el formato RFC3339 (con offset para la zona horaria). "
-                "Por ejemplo: 2026-06-20T08:00:00-05:00"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "summary": {
-                        "type": "string",
-                        "description": "el título del evento"
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "la descripción del evento (opcional)"
-                    },
-                    "start": {
-                        "type": "string",
-                        "description": "la fecha y hora de inicio del evento en formato RFC3339"
-                    },
-                    "end": {
-                        "type": "string",
-                        "description": "la fecha y hora de fin del evento en formato RFC3339"
+                        "description": "La pregunta del usuario"
                     }
                 }
             },
-            "required": ["summary", "start", "end"]
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_events",
-            "description": (
-                "Lista los eventos del calendario del usuario entre time_ini y time_end "
-                "usando Google Calendar. Los datos time_ini y time_end DEBEN estar en el formato "
-                "RFC3339 (con offset para la zona horaria). Por ejemplo: "
-                "2026-06-20T08:00:00-05:00"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "time_ini": {
-                        "type": "string",
-                        "description": "la fecha de inicio para revisar disponibilidad en formato RFC3339"
-                    },
-                    "time_end": {
-                        "type": "string",
-                        "description": "la fecha fin para revisar disponibilidad en formato RFC3339"
-                    }
-                },
-                "required": ["time_ini", "time_end"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "delete_event",
-            "description": (
-                "Elimina un evento del calendario del usuario usando Google Calendar. "
-                "Se requiere el event_id del evento a eliminar."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "event_id": {
-                        "type": "string",
-                        "description": "el ID del evento a eliminar"
-                    }
-                },
-                "required": ["event_id"]
-            }
+            "required": ["query"]
         }
     }
 ]
@@ -168,31 +105,16 @@ def process_response(client:Groq, memory_messages:list[dict], user_text:str):
             name = tool_call.function.name
             args = json.loads(tool_call.function.arguments or {})
 
-            if name == "check_availability":
-                tools = Tools()
-                result = tools.check_availability(
-                    time_ini=args["time_ini"],
-                    time_end=args["time_end"]
-                )
-            elif name == "create_event":
-                tools = Tools()
-                result = tools.create_event(
-                    summary=args["summary"],
-                    start=args["start"],
-                    end=args["end"],
-                    description=args.get("description", "")
-                )
-            elif name == "list_events":
-                tools = Tools()
-                result = tools.list_events(
-                    time_ini=args["time_ini"],
-                    time_end=args["time_end"]
-                )
-            elif name == "delete_event":
-                tools = Tools()
-                result = tools.delete_event(
-                    event_id=args["event_id"]
-                )
+            if name == "politicas_de_devoluciones":
+                query = args["query"]
+                print(f"Llamando función politicas_de_devoluciones con {query}")
+                emb = embedder.embed_query(query)
+                hits = store.search(query_emb=emb)
+
+                result = {
+                    "query": query,
+                    "matches": hits
+                }
             else:
                 print(f"Se intentó llamar a una tool desconocida {name}")
                 result = {"error": f"Herramienta desconocida: {name}" }
